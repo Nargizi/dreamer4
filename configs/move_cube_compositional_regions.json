@@ -1,0 +1,242 @@
+{
+  "name": "single_cube_100_combinations_with_regions",
+  "description": "Sixty training combinations, fifteen novel combinations of shared levels, and twenty-five isolated factor-level holdouts. Start and goal coordinates are randomized per episode inside categorical front-camera regions.",
+  "env_types": ["single"],
+  "combination_seed": 26052026,
+  "position_sampling": {
+    "coordinate_frame": "MuJoCo world x-y; labels approximate quadrants in front_pixels",
+    "workspace_low": [0.3, -0.3],
+    "workspace_high": [0.55, 0.3],
+    "minimum_start_goal_distance": 0.08,
+    "max_attempts": 100
+  },
+  "splits": {
+    "train": {
+      "num_combinations": 60
+    },
+    "test_combinations": {
+      "num_combinations": 15,
+      "holdout": {
+        "type": "combination",
+        "levels": "shared_only",
+        "require_all_levels_seen_in_train": true,
+        "factor_pairs": {
+          "factors": ["cube.start_region", "cube.goal_region"],
+          "values": [
+            ["top_left", "bottom_right"],
+            ["bottom_right", "top_right"],
+            ["top_right", "top_left"]
+          ]
+        }
+      }
+    },
+    "test_features": {
+      "num_combinations": 25,
+      "holdout": {
+        "type": "factor_level",
+        "isolate_one_held_out_factor_per_combination": true,
+        "groups": [
+          {
+            "factor": "cube.color",
+            "levels": ["purple", "cyan"],
+            "num_combinations": 10
+          },
+          {
+            "factor": "cube.size",
+            "levels": ["held_out_medium"],
+            "num_combinations": 5
+          },
+          {
+            "factor": "cube.start_region",
+            "levels": ["bottom_left"],
+            "num_combinations": 5
+          },
+          {
+            "factor": "cube.goal_region",
+            "levels": ["bottom_left"],
+            "num_combinations": 5
+          }
+        ]
+      }
+    }
+  },
+  "factors": [
+    {
+      "name": "cube.color",
+      "levels": [
+        {
+          "name": "red",
+          "availability": "shared",
+          "value": [[0.96, 0.26, 0.33]]
+        },
+        {
+          "name": "blue",
+          "availability": "shared",
+          "value": [[0.35, 0.55, 0.91]]
+        },
+        {
+          "name": "orange",
+          "availability": "shared",
+          "value": [[1.0, 0.69, 0.21]]
+        },
+        {
+          "name": "green",
+          "availability": "shared",
+          "value": [[0.06, 0.74, 0.21]]
+        },
+        {
+          "name": "purple",
+          "availability": "test_only",
+          "value": [[0.61, 0.28, 0.82]]
+        },
+        {
+          "name": "cyan",
+          "availability": "test_only",
+          "value": [[0.1, 0.75, 0.75]]
+        }
+      ]
+    },
+    {
+      "name": "cube.size",
+      "levels": [
+        {
+          "name": "extra_small",
+          "availability": "shared",
+          "value": [0.016]
+        },
+        {
+          "name": "small",
+          "availability": "shared",
+          "value": [0.018]
+        },
+        {
+          "name": "held_out_medium",
+          "availability": "test_only",
+          "value": [0.02]
+        },
+        {
+          "name": "large",
+          "availability": "shared",
+          "value": [0.022]
+        },
+        {
+          "name": "extra_large",
+          "availability": "shared",
+          "value": [0.024]
+        }
+      ]
+    },
+    {
+      "name": "floor.color",
+      "levels": [
+        {
+          "name": "navy",
+          "availability": "shared",
+          "value": [[0.08, 0.11, 0.16], [0.15, 0.18, 0.25]]
+        },
+        {
+          "name": "sand",
+          "availability": "shared",
+          "value": [[0.46, 0.38, 0.25], [0.68, 0.59, 0.42]]
+        },
+        {
+          "name": "gray",
+          "availability": "shared",
+          "value": [[0.24, 0.24, 0.24], [0.48, 0.48, 0.48]]
+        },
+        {
+          "name": "plum",
+          "availability": "shared",
+          "value": [[0.22, 0.12, 0.25], [0.43, 0.27, 0.47]]
+        }
+      ]
+    },
+    {
+      "name": "light.intensity",
+      "levels": [
+        {
+          "name": "low",
+          "availability": "shared",
+          "value": [0.4]
+        },
+        {
+          "name": "medium_low",
+          "availability": "shared",
+          "value": [0.6]
+        },
+        {
+          "name": "medium_high",
+          "availability": "shared",
+          "value": [0.8]
+        },
+        {
+          "name": "high",
+          "availability": "shared",
+          "value": [1.0]
+        }
+      ]
+    },
+    {
+      "name": "cube.start_region",
+      "kind": "position_region",
+      "variation": "cube.start_position",
+      "levels": [
+        {
+          "name": "top_left",
+          "availability": "shared",
+          "low": [0.3, -0.3],
+          "high": [0.425, 0.0]
+        },
+        {
+          "name": "top_right",
+          "availability": "shared",
+          "low": [0.3, 0.0],
+          "high": [0.425, 0.3]
+        },
+        {
+          "name": "bottom_right",
+          "availability": "shared",
+          "low": [0.425, 0.0],
+          "high": [0.55, 0.3]
+        },
+        {
+          "name": "bottom_left",
+          "availability": "test_only",
+          "low": [0.425, -0.3],
+          "high": [0.55, 0.0]
+        }
+      ]
+    },
+    {
+      "name": "cube.goal_region",
+      "kind": "position_region",
+      "variation": "cube.goal_position",
+      "levels": [
+        {
+          "name": "top_left",
+          "availability": "shared",
+          "low": [0.3, -0.3],
+          "high": [0.425, 0.0]
+        },
+        {
+          "name": "top_right",
+          "availability": "shared",
+          "low": [0.3, 0.0],
+          "high": [0.425, 0.3]
+        },
+        {
+          "name": "bottom_right",
+          "availability": "shared",
+          "low": [0.425, 0.0],
+          "high": [0.55, 0.3]
+        },
+        {
+          "name": "bottom_left",
+          "availability": "test_only",
+          "low": [0.425, -0.3],
+          "high": [0.55, 0.0]
+        }
+      ]
+    }
+  ]
+}

@@ -16,9 +16,11 @@ from PIL import Image
 import io
 
 from task_set import TASK_SET
-from model import (
-    Encoder, Decoder, Tokenizer, Dynamics,
-    temporal_patchify, temporal_unpatchify,
+from model import Dynamics
+from sd3_frozen_encoder import (
+    SD3FrozenEncoder,
+    dtype_from_string,
+    load_frozen_sd3_encoder,
 )
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -208,12 +210,6 @@ def load_frame_from_shards(frames_dir: str, task: str, index: int, *, shard_size
     return fr.to(torch.float32) / 255.0
 
 
-def _strip_prefix(sd: dict, prefix: str) -> dict:
-    if not any(k.startswith(prefix) for k in sd.keys()):
-        return sd
-    return {k[len(prefix):]: v for k, v in sd.items()}
-
-
 def _looks_like_state_dict(d: dict) -> bool:
     if not isinstance(d, dict) or len(d) == 0:
         return False
@@ -237,133 +233,150 @@ def _get_state_dict(ckpt: dict) -> dict:
         else:
             raise KeyError(f"Could not find state dict in checkpoint keys={list(ckpt.keys())}")
 
-    for pfx in ("module.", "dynamics.", "dyn."):
-        sd = _strip_prefix(sd, pfx)
-    return sd
+    cleaned = {}
+    for key, value in sd.items():
+        while key.startswith(("module.", "_orig_mod.", "dynamics.", "dyn.")):
+            key = key.split(".", 1)[1]
+        cleaned[key] = value
+    return cleaned
 
 
-def load_tokenizer_from_ckpt(tokenizer_ckpt: str, device: torch.device):
-    ckpt = torch.load(tokenizer_ckpt, map_location="cpu")
-    a = ckpt.get("args", {}) or {}
-
-    H = int(a.get("H", 128))
-    W = int(a.get("W", 128))
-    C = int(a.get("C", 3))
-    patch = int(a.get("patch", 4))
-    d_model = int(a.get("d_model", 256))
-    n_heads = int(a.get("n_heads", 4))
-    depth = int(a.get("depth", 8))
-    n_latents = int(a.get("n_latents", 16))
-    d_bottleneck = int(a.get("d_bottleneck", 32))
-    dropout = float(a.get("dropout", 0.0))
-    mlp_ratio = float(a.get("mlp_ratio", 4.0))
-    time_every = int(a.get("time_every", 1))
-    scale_pos_embeds = bool(a.get("scale_pos_embeds", True))
-
-    assert H % patch == 0 and W % patch == 0
-    n_patches = (H // patch) * (W // patch)
-    d_patch = patch * patch * C
-
-    enc = Encoder(
-        patch_dim=d_patch,
-        d_model=d_model,
-        n_latents=n_latents,
-        n_patches=n_patches,
-        n_heads=n_heads,
-        depth=depth,
-        d_bottleneck=d_bottleneck,
-        dropout=dropout,
-        mlp_ratio=mlp_ratio,
-        time_every=time_every,
-        mae_p_min=0.0,
-        mae_p_max=0.0,
-        scale_pos_embeds=scale_pos_embeds,
-    )
-    dec = Decoder(
-        d_bottleneck=d_bottleneck,
-        d_model=d_model,
-        n_heads=n_heads,
-        depth=depth,
-        n_latents=n_latents,
-        n_patches=n_patches,
-        d_patch=d_patch,
-        dropout=dropout,
-        mlp_ratio=mlp_ratio,
-        time_every=time_every,
-        scale_pos_embeds=scale_pos_embeds,
-    )
-    tok = Tokenizer(enc, dec).to(device)
-    tok.load_state_dict(_get_state_dict(ckpt), strict=True)
-    tok.eval()
-    for p in tok.parameters():
-        p.requires_grad_(False)
-
-    info = dict(H=H, W=W, C=C, patch=patch, n_latents=n_latents, d_bottleneck=d_bottleneck)
-    return tok, info
+def resolve_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(name)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA device requested but CUDA is unavailable: {name}")
+    return device
 
 
-def load_dynamics_from_ckpt(
-    dynamics_ckpt: str,
-    *,
+def load_sd3_and_dynamics(
+    args: argparse.Namespace,
     device: torch.device,
-    d_bottleneck: int,
-    n_latents: int,
-    packing_factor: int,
-):
-    ckpt = torch.load(dynamics_ckpt, map_location="cpu")
-    a = ckpt.get("args", {}) or {}
+) -> Tuple[SD3FrozenEncoder, SD3FrozenEncoder, Dynamics, Dict[str, Any]]:
+    """Recreate the frozen SD3 tokenizer and dynamics model from one checkpoint."""
+    checkpoint = torch.load(args.dynamics_ckpt, map_location="cpu", weights_only=False)
+    train_args = dict(checkpoint.get("args", {}) or {})
 
-    d_model = int(a.get("d_model_dyn", a.get("dyn_d_model", a.get("d_model", 256))))
-    n_heads = int(a.get("n_heads", 4))
-    depth = int(a.get("dyn_depth", a.get("depth", 8)))
-    dropout = float(a.get("dropout", 0.0))
-    mlp_ratio = float(a.get("mlp_ratio", 4.0))
-    time_every = int(a.get("time_every", 4))
-    k_max = int(a.get("k_max", 8))
-    n_register = int(a.get("n_register", 4))
-    n_agent = int(a.get("n_agent", 0))
-    space_mode = str(a.get("space_mode", a.get("agent_space_mode", "wm_agent_isolated")))
-    scale_pos_embeds = bool(a.get("scale_pos_embeds", True))
+    if (
+        "use_stable_diffusion_model" in train_args
+        and not bool(train_args["use_stable_diffusion_model"])
+    ):
+        raise ValueError(
+            "The dynamics checkpoint says it was trained with the learned "
+            "Dreamer tokenizer, not the frozen SD3 tokenizer."
+        )
 
-    assert n_latents % packing_factor == 0
+    height = int(args.image_size or train_args.get("H") or 128)
+    width = int(args.image_size or train_args.get("W") or height)
+    if height % 8 or width % 8:
+        raise ValueError(
+            f"SD3 requires image dimensions divisible by 8, got {height}x{width}"
+        )
+
+    model_name = args.sd3_model_name or train_args.get(
+        "sd3_model_name",
+        "stabilityai/stable-diffusion-3-medium-diffusers",
+    )
+    latent_patch_size = int(
+        args.sd3_latent_patch_size
+        or train_args.get("sd3_latent_patch_size", 2)
+    )
+    dtype_name = args.sd3_dtype or train_args.get("sd3_dtype", "float16")
+    if device.type == "cpu" and dtype_name != "float32":
+        print("[tokenizer] forcing float32 because the SD3 VAE is on CPU")
+        dtype_name = "float32"
+
+    encoder, decoder, tokenizer_info = load_frozen_sd3_encoder(
+        device=device,
+        model_name=model_name,
+        H=height,
+        W=width,
+        latent_patch_size=latent_patch_size,
+        torch_dtype=dtype_from_string(dtype_name),
+        strict_input_range=True,
+    )
+
+    packing_factor = int(
+        args.packing_factor
+        if args.packing_factor is not None
+        else train_args.get("packing_factor", 2)
+    )
+    n_latents = int(tokenizer_info["n_latents"])
+    d_bottleneck = int(tokenizer_info["d_bottleneck"])
+    if n_latents % packing_factor:
+        raise ValueError(
+            f"SD3 n_latents={n_latents} is not divisible by "
+            f"packing_factor={packing_factor}"
+        )
+
     n_spatial = n_latents // packing_factor
     d_spatial = d_bottleneck * packing_factor
+    k_max = int(train_args.get("k_max", 8))
 
-    dyn = Dynamics(
-        d_model=d_model,
+    dynamics = Dynamics(
+        d_model=int(
+            train_args.get(
+                "d_model_dyn",
+                train_args.get("dyn_d_model", train_args.get("d_model", 512)),
+            )
+        ),
         d_bottleneck=d_bottleneck,
         d_spatial=d_spatial,
         n_spatial=n_spatial,
-        n_register=n_register,
-        n_agent=n_agent,
-        n_heads=n_heads,
-        depth=depth,
+        n_register=int(train_args.get("n_register", 4)),
+        n_agent=int(train_args.get("n_agent", 1)),
+        n_heads=int(train_args.get("n_heads", 4)),
+        depth=int(train_args.get("dyn_depth", train_args.get("depth", 8))),
         k_max=k_max,
-        dropout=dropout,
-        mlp_ratio=mlp_ratio,
-        time_every=time_every,
-        space_mode=space_mode,
-        scale_pos_embeds=scale_pos_embeds,
+        dropout=float(train_args.get("dropout", 0.0)),
+        mlp_ratio=float(train_args.get("mlp_ratio", 4.0)),
+        time_every=int(train_args.get("time_every", 1)),
+        space_mode=str(
+            train_args.get(
+                "space_mode",
+                train_args.get("agent_space_mode", "wm_agent_isolated"),
+            )
+        ),
+        scale_pos_embeds=bool(
+            checkpoint.get(
+                "scale_pos_embeds",
+                train_args.get("scale_pos_embeds", True),
+            )
+        ),
     ).to(device)
-    dyn.load_state_dict(_get_state_dict(ckpt), strict=True)
-    dyn.eval()
-    return dyn, {"k_max": k_max, "n_spatial": n_spatial, "d_spatial": d_spatial}
+    dynamics.load_state_dict(_get_state_dict(checkpoint), strict=True)
+    dynamics.eval()
+
+    metadata = {
+        "H": height,
+        "W": width,
+        "C": 3,
+        "n_latents": n_latents,
+        "d_bottleneck": d_bottleneck,
+        "packing_factor": packing_factor,
+        "n_spatial": n_spatial,
+        "d_spatial": d_spatial,
+        "k_max": k_max,
+        "sd3_model_name": model_name,
+        "sd3_latent_patch_size": latent_patch_size,
+        "sd3_dtype": dtype_name,
+    }
+    return encoder, decoder, dynamics, metadata
 
 
 @torch.inference_mode()
 def decode_single_packed_frame(
-    decoder: Decoder,
+    decoder: SD3FrozenEncoder,
     *,
     z_packed: torch.Tensor,   # (n_spatial,d_spatial) or (1,n_spatial,d_spatial)
-    H: int, W: int, C: int, patch: int,
     packing_factor: int,
     d_bottleneck: int,
 ) -> torch.Tensor:
     z2 = _as_2d_packed(z_packed)
     z_bt = z2.unsqueeze(0).unsqueeze(0)  # (1,1,n_spatial,d_spatial)
     z_btLd = unpack_spatial_to_bottleneck(z_bt, k=packing_factor, d_bottleneck=d_bottleneck)
-    patches = decoder(z_btLd)  # (1,1,Np,Dp)
-    frames = temporal_unpatchify(patches, H, W, C, patch)  # (1,1,C,H,W)
+    frames = decoder.decode(z_btLd)  # (1,1,3,H,W)
     return frames[0, 0].clamp(0, 1)
 
 
@@ -431,7 +444,7 @@ class InteractiveServer:
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
 
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.device = resolve_device(args.device)
         self.use_amp = bool(args.amp) and (self.device.type == "cuda")
         self.infer_lock = asyncio.Lock()
 
@@ -442,29 +455,28 @@ class InteractiveServer:
         self.tasks = list(TASK_SET)
         self.initial_task = args.task if args.task in self.tasks else self.tasks[0]
 
-        # tokenizer
-        tok, tok_info = load_tokenizer_from_ckpt(args.tokenizer_ckpt, self.device)
-        self.encoder: Encoder = tok.encoder
-        self.decoder: Decoder = tok.decoder
-
-        self.d_bottleneck = int(tok_info["d_bottleneck"])
-        self.n_latents = int(tok_info["n_latents"])
-        self.H = int(tok_info["H"])
-        self.W = int(tok_info["W"])
-        self.C = int(tok_info["C"])
-        self.patch = int(tok_info["patch"])
-
-        # dynamics
-        self.dyn, dyn_info = load_dynamics_from_ckpt(
-            args.dynamics_ckpt,
-            device=self.device,
-            d_bottleneck=self.d_bottleneck,
-            n_latents=self.n_latents,
-            packing_factor=args.packing_factor,
+        # Frozen SD3 tokenizer and dynamics are reconstructed from the same
+        # dynamics checkpoint, preventing latent-shape/config mismatches.
+        self.encoder, self.decoder, self.dyn, model_info = load_sd3_and_dynamics(
+            args, self.device
         )
-        self.k_max = int(dyn_info["k_max"])
-        self.n_spatial = int(dyn_info["n_spatial"])
-        self.d_spatial = int(dyn_info["d_spatial"])
+        self.d_bottleneck = int(model_info["d_bottleneck"])
+        self.n_latents = int(model_info["n_latents"])
+        self.H = int(model_info["H"])
+        self.W = int(model_info["W"])
+        self.C = int(model_info["C"])
+        self.packing_factor = int(model_info["packing_factor"])
+        self.k_max = int(model_info["k_max"])
+        self.n_spatial = int(model_info["n_spatial"])
+        self.d_spatial = int(model_info["d_spatial"])
+        print(
+            "[tokenizer] "
+            f"SD3 model={model_info['sd3_model_name']} "
+            f"image={self.H}x{self.W} "
+            f"latent_patch={model_info['sd3_latent_patch_size']} "
+            f"n_latents={self.n_latents} d_bottleneck={self.d_bottleneck} "
+            f"packing={self.packing_factor}"
+        )
 
         self.sched = make_tau_schedule(
             k_max=self.k_max,
@@ -490,9 +502,12 @@ class InteractiveServer:
     @torch.inference_mode()
     def _encode_initial_latent(self, task: str, start_idx: int) -> torch.Tensor:
         frame0 = load_frame_from_shards(self.args.frames_dir, task, start_idx, shard_size=self.args.shard_size).to(self.device)
-        patches0 = temporal_patchify(frame0.view(1, 1, self.C, self.H, self.W), self.patch)
-        z0_btLd, _ = self.encoder(patches0)
-        z0_packed = pack_bottleneck_to_spatial(z0_btLd, n_spatial=self.n_spatial, k=self.args.packing_factor)[0, 0]
+        z0_btLd = self.encoder(frame0.unsqueeze(0).unsqueeze(0))
+        z0_packed = pack_bottleneck_to_spatial(
+            z0_btLd,
+            n_spatial=self.n_spatial,
+            k=self.packing_factor,
+        )[0, 0]
         z0_packed = z0_packed.to(torch.float16) if (self.use_amp and self.device.type == "cuda") else z0_packed.to(torch.float32)
         return z0_packed.detach()
 
@@ -656,8 +671,7 @@ class InteractiveServer:
             fr = decode_single_packed_frame(
                 self.decoder,
                 z_packed=z_cur,
-                H=self.H, W=self.W, C=self.C, patch=self.patch,
-                packing_factor=self.args.packing_factor,
+                packing_factor=self.packing_factor,
                 d_bottleneck=self.d_bottleneck,
             )
             st.cached_jpeg = frame_to_jpeg_bytes(fr, quality=int(self.args.jpeg_quality))
@@ -783,21 +797,29 @@ class InteractiveServer:
 def main():
     p = argparse.ArgumentParser()
 
-    p.add_argument("--task", type=str, default="finger-turn-hard")
+    p.add_argument("--task", type=str, default="move-cube")
 
     # data
     p.add_argument("--data_dir", type=str, default="/<path>/data")   # path to raw data
-    p.add_argument("--frames_dir", type=str, default="/<path>/frames128")   # path to processed frames
+    p.add_argument("--frames_dir", type=str, default="/<path>/frames224")   # path to processed frames
     p.add_argument("--tasks_json", type=str, default="../tasks.json")   # task metadata
     p.add_argument("--shard_size", type=int, default=2048)
 
-    # checkpoints
-    p.add_argument("--tokenizer_ckpt", type=str, default="./logs/tokenizer_ckpts/step_0085000.pt")
+    # SD3 tokenizer settings default to the values stored in dynamics_ckpt.
     p.add_argument("--dynamics_ckpt", type=str, default="./logs/dynamics_ckpts/latest.pt")
+    p.add_argument("--image_size", type=int, default=128)
+    p.add_argument("--sd3_model_name", type=str, default="stabilityai/stable-diffusion-3-medium-diffusers")
+    p.add_argument("--sd3_latent_patch_size", type=int, default=2)
+    p.add_argument(
+        "--sd3_dtype",
+        type=str,
+        default="float16",
+        choices=["float32", "float16", "bfloat16"],
+    )
 
     # rollout
     p.add_argument("--fps", type=float, default=10.0)
-    p.add_argument("--packing_factor", type=int, default=2)
+    p.add_argument("--packing_factor", type=int, default=None)
     p.add_argument("--ctx_window", type=int, default=24)
     p.add_argument("--schedule", type=str, default="shortcut", choices=["finest", "shortcut"])
     p.add_argument("--eval_d", type=float, default=0.5)
@@ -812,6 +834,7 @@ def main():
 
     # misc
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", type=str, default="auto")
 
     args = p.parse_args()
 

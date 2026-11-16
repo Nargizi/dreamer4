@@ -904,14 +904,10 @@ if __name__ == "__main__":
 
     # data (if using multiple datasets, make sure they align in order)
     p.add_argument("--data_dirs", type=str, nargs="+", default=[   # paths to raw data
-        "/<path>/expert",
-        "/<path>/mixed-small",
-        "/<path>/mixed-large",
+        "/home/martius/mot449/Projects/MoveCubeSingleRaw-medium"
     ])
     p.add_argument("--frame_dirs", type=str, nargs="+", default=[  # paths to preprocessed frames
-        "/<path>/expert-shards",
-        "/<path>/mixed-small-shards",
-        "/<path>/mixed-large-shards",
+        "/home/martius/mot449/Projects/MoveCubeSingle-medium",
     ])
     p.add_argument("--tasks_json", type=str, default="../tasks.json")  # task metadata
     p.add_argument("--seq_len", type=int, default=32)
@@ -919,7 +915,7 @@ if __name__ == "__main__":
     p.add_argument("--batch_size", type=int, default=24)
 
     # tokenizer restore
-    p.add_argument("--tokenizer_ckpt", type=str, default="./logs/tokenizer_ckpts/latest.pt")
+    p.add_argument("--tokenizer_ckpt", type=str, default="/home/martius/mot449/Projects/tokenizer.pt")
     p.add_argument("--H", type=int, default=None)
     p.add_argument("--W", type=int, default=None)
     p.add_argument("--C", type=int, default=None)
@@ -951,7 +947,7 @@ if __name__ == "__main__":
     p.add_argument("--use_actions", action="store_true")
 
     # optim
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=3e-5)
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--max_steps", type=int, default=10_000_000)
     p.add_argument("--grad_accum", type=int, default=1)

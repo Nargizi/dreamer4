@@ -65,6 +65,7 @@ def init_distributed() -> tuple[bool, int, int, int]:
 
 def save_ckpt(path: Path, *, step: int, epoch: int, dyn_model, opt, scaler, args: argparse.Namespace):
     path.parent.mkdir(parents=True, exist_ok=True)
+    print(path)
     obj = {
         "step": step,
         "epoch": epoch,
@@ -1059,7 +1060,9 @@ def train(args):
                     )
 
                 # Checkpointing
-                if is_rank0() and args.save_every > 0 and (step % args.save_every == 0) and do_step:
+                print("Trying Checkpointing:", step)
+                if is_rank0() and args.save_every > 0 and ((step + 1) % args.save_every == 0) and do_step:
+                    print("Checkpointing Inside:", step)
                     ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
                     save_ckpt(ckpt_path, step=step, epoch=epoch, dyn_model=dyn, opt=opt, scaler=scaler, args=args)
                     latest = ckpt_dir / "latest.pt"
@@ -1076,13 +1079,11 @@ def train(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-
-    # data (if using multiple datasets, make sure they align in order)
     p.add_argument("--data_dirs", type=str, nargs="+", default=[   # paths to raw data
-        "/home/giorgi/Sizmara/data",
+        "/home/martius/mot449/Projects/MoveCubeSingleTrainRaw"
     ])
     p.add_argument("--frame_dirs", type=str, nargs="+", default=[  # paths to preprocessed frames
-        "/home/giorgi/Sizmara/processed_data",
+        "/home/martius/mot449/Projects/MoveCubeSingleTrain",
     ])
     p.add_argument("--tasks_json", type=str, default="../tasks.json")  # task metadata
     p.add_argument("--seq_len", type=int, default=32)
@@ -1127,7 +1128,7 @@ if __name__ == "__main__":
     p.add_argument("--use_actions", action="store_true")
 
     # optim
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--max_steps", type=int, default=10_000_000)
     p.add_argument("--grad_accum", type=int, default=1)
@@ -1143,7 +1144,7 @@ if __name__ == "__main__":
     p.add_argument("--eval_d", type=float, default=0.25)
 
     # logging
-    p.add_argument("--log_every", type=int, default=200)
+    p.add_argument("--log_every", type=int, default=10_000)
 
     # wandb
     p.add_argument("--wandb_project", type=str, default="dreamer4-dynamics")
@@ -1152,7 +1153,7 @@ if __name__ == "__main__":
 
     # ckpt
     p.add_argument("--ckpt_dir", type=str, default="./logs/dynamics_ckpts")
-    p.add_argument("--save_every", type=int, default=10_000)
+    p.add_argument("--save_every", type=int, default=20_000)
     p.add_argument("--resume", type=str, default=None)
 
     # misc
